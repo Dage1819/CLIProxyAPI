@@ -200,16 +200,18 @@ func (b *Builder) Build() (*Service, error) {
 		}
 
 		strategy := ""
+		maxReqs := 0
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
+			maxReqs = b.cfg.Routing.MaxRequestsPerCredential
+		}
+		// If max-requests-per-credential is set, automatically use fill-first strategy
+		if maxReqs > 0 {
+			strategy = "fill-first"
 		}
 		var selector coreauth.Selector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
-			maxReqs := 0
-			if b.cfg != nil {
-				maxReqs = b.cfg.Routing.MaxRequestsPerCredential
-			}
 			selector = coreauth.NewFillFirstSelector(maxReqs)
 		default:
 			selector = &coreauth.RoundRobinSelector{}
