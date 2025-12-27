@@ -6,7 +6,6 @@ package cmd
 import (
 	"context"
 	"errors"
-	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -28,19 +27,16 @@ import (
 //   - configPath: The path to the configuration file
 //   - localPassword: Optional password accepted for local management requests
 func StartService(cfg *config.Config, configPath string, localPassword string) {
-	// Enable usage statistics persistence (save to executable directory)
-	exePath, err := os.Executable()
-	if err == nil {
-		exeDir := filepath.Dir(exePath)
-		if err := usage.EnablePersistence(exeDir); err != nil {
+	// Enable usage statistics persistence (save to config file directory)
+	if configPath != "" {
+		configDir := filepath.Dir(configPath)
+		if err := usage.EnablePersistence(configDir); err != nil {
 			log.WithError(err).Warn("failed to enable usage statistics persistence")
 		} else {
 			if err := usage.LoadStatistics(); err != nil {
 				log.WithError(err).Warn("failed to load usage statistics")
 			}
 		}
-	} else {
-		log.WithError(err).Warn("failed to get executable path for usage statistics")
 	}
 
 	builder := cliproxy.NewBuilder().
