@@ -23,7 +23,14 @@ type RoundRobinSelector struct {
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+// When MaxRequestsPerCredential is set, it rotates to the next credential after
+// that many requests.
+type FillFirstSelector struct {
+	mu                       sync.Mutex
+	maxRequestsPerCredential int
+	requestCounts            map[string]int // key: authID, value: request count
+	currentIndex             map[string]int // key: provider:model, value: current credential index
+}
 
 type blockReason int
 
@@ -172,6 +179,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 }
 
 // Pick selects the first available auth for the provider in a deterministic manner.
+// When maxRequestsPerCredential is set, it rotates to the next credential after reaching the limit.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = ctx
 	_ = opts
@@ -180,7 +188,61 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	if err != nil {
 		return nil, err
 	}
-	return available[0], nil
+
+	// If no max requests limit is set, use simple fill-first
+	if s.maxRequestsPerCredential <= 0 {
+		return available[0], nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.requestCounts == nil {
+		s.requestCounts = make(map[string]int)
+	}
+	if s.currentIndex == nil {
+		s.currentIndex = make(map[string]int)
+	}
+
+	key := provider + ":" + model
+	currentIdx := s.currentIndex[key]
+
+	// Ensure index is within bounds
+	if currentIdx >= len(available) {
+		currentIdx = 0
+		s.currentIndex[key] = 0
+	}
+
+	selected := available[currentIdx]
+	s.requestCounts[selected.ID]++
+
+	// Check if we need to rotate to next credential
+	if s.requestCounts[selected.ID] >= s.maxRequestsPerCredential {
+		s.requestCounts[selected.ID] = 0
+		nextIdx := currentIdx + 1
+		if nextIdx >= len(available) {
+			nextIdx = 0
+		}
+		s.currentIndex[key] = nextIdx
+	}
+
+	return selected, nil
+}
+
+// SetMaxRequestsPerCredential sets the maximum requests per credential before rotation.
+func (s *FillFirstSelector) SetMaxRequestsPerCredential(max int) {
+	s.mu.Lock()
+	s.maxRequestsPerCredential = max
+	s.mu.Unlock()
+}
+
+// NewFillFirstSelector creates a new FillFirstSelector with optional max requests limit.
+func NewFillFirstSelector(maxRequestsPerCredential int) *FillFirstSelector {
+	return &FillFirstSelector{
+		maxRequestsPerCredential: maxRequestsPerCredential,
+		requestCounts:            make(map[string]int),
+		currentIndex:             make(map[string]int),
+	}
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {

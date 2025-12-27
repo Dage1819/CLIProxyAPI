@@ -132,6 +132,11 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// MaxRequestsPerCredential limits the number of requests per credential before rotating.
+	// When set to a positive value (e.g., 100), each credential will be used for at most
+	// that many requests before switching to the next one. Leave empty or set to 0 to disable.
+	MaxRequestsPerCredential int `yaml:"max-requests-per-credential,omitempty" json:"max-requests-per-credential,omitempty"`
 }
 
 // AmpModelMapping defines a model name mapping for Amp CLI requests.

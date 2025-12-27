@@ -69,6 +69,7 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
+  # max-requests-per-credential: 100 # Only for fill-first: rotate to next credential after N requests (0 = disabled)
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

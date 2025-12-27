@@ -206,7 +206,11 @@ func (b *Builder) Build() (*Service, error) {
 		var selector coreauth.Selector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
+			maxReqs := 0
+			if b.cfg != nil {
+				maxReqs = b.cfg.Routing.MaxRequestsPerCredential
+			}
+			selector = coreauth.NewFillFirstSelector(maxReqs)
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}
