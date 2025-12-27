@@ -89,11 +89,21 @@ rebuild_service() {
     # 1. 停止现有服务
     stop_service
     
-    # 2. 检查Go环境
+    # 2. 检查并安装依赖
+    log_info "检查依赖..."
+    if ! command -v git &> /dev/null; then
+        log_info "安装 git..."
+        apt update && apt install -y git
+    fi
+    
     if ! command -v go &> /dev/null; then
-        log_error "Go未安装"
-        echo "安装命令: apt update && apt install -y golang"
-        return 1
+        log_info "安装 golang..."
+        apt update && apt install -y golang
+    fi
+    
+    if ! command -v curl &> /dev/null; then
+        log_info "安装 curl..."
+        apt update && apt install -y curl
     fi
     
     # 3. 进入运行目录
