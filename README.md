@@ -45,6 +45,37 @@ Get 10% OFF GLM CODING PLAN：https://z.ai/subscribe?ic=8JVLJQFSKB
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+### Quick Deploy Script (Linux)
+
+A one-click deployment script `qd.sh` is provided for easy installation and management:
+
+```bash
+wget https://raw.githubusercontent.com/Dage1819/CLIProxyAPI/main/qd.sh
+chmod +x qd.sh
+./qd.sh
+```
+
+The script provides three options:
+1. **Start/Restart service** - Start or restart the CLIProxyAPI service
+2. **Stop service** - Stop the running service
+3. **Rebuild and start** - Clone latest code, compile and start
+
+### Credential Rotation Configuration
+
+You can configure how credentials are rotated when multiple accounts are available:
+
+```yaml
+routing:
+  # Rotate to next credential after N requests
+  # When set, automatically uses fill-first strategy
+  max-requests-per-credential: 100
+```
+
+- When `max-requests-per-credential` is set (e.g., 100), each credential will be used for that many requests before switching to the next one
+- Credentials are ordered by ID alphabetically
+- After all credentials are used, rotation starts from the first one again
+- If not set or set to 0, the default round-robin strategy is used (rotates on every request)
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

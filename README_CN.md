@@ -44,6 +44,37 @@ GLM CODING PLAN 是专为AI编码打造的订阅套餐，每月最低仅需20元
 
 CLIProxyAPI 用户手册： [https://help.router-for.me/](https://help.router-for.me/cn/)
 
+### 一键部署脚本 (Linux)
+
+提供一键部署脚本 `qd.sh`，方便安装和管理：
+
+```bash
+wget https://raw.githubusercontent.com/Dage1819/CLIProxyAPI/main/qd.sh
+chmod +x qd.sh
+./qd.sh
+```
+
+脚本提供三个选项：
+1. **启动/重启服务** - 启动或重启 CLIProxyAPI 服务
+2. **停止服务** - 停止正在运行的服务
+3. **重新构建并启动** - 克隆最新代码、编译并启动
+
+### 凭据轮换配置
+
+当有多个账户可用时，可以配置凭据轮换策略：
+
+```yaml
+routing:
+  # 每 N 次请求后切换到下一个凭据
+  # 设置后自动使用 fill-first 策略
+  max-requests-per-credential: 100
+```
+
+- 设置 `max-requests-per-credential`（如 100）后，每个凭据使用该次数后切换到下一个
+- 凭据按 ID 字母顺序排列
+- 所有凭据轮换完后，从第一个重新开始
+- 如果不设置或设为 0，使用默认的 round-robin 策略（每次请求轮换）
+
 ## 管理 API 文档
 
 请参见 [MANAGEMENT_API_CN.md](https://help.router-for.me/cn/management/api)
