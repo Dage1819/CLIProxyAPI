@@ -1,0 +1,1221 @@
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Card } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
+import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
+import { Input } from '@/components/ui/Input';
+import { Modal } from '@/components/ui/Modal';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { IconBot, IconDownload, IconInfo, IconTrash2, IconPieChart, IconClock } from '@/components/ui/icons';
+import { useAuthStore, useNotificationStore, useThemeStore } from '@/stores';
+import { authFilesApi, usageApi } from '@/services/api';
+import type { AntigravityQuotaInfo } from '@/services/api/authFiles';
+import { apiClient } from '@/services/api/client';
+import type { AuthFileItem } from '@/types';
+import type { KeyStats, KeyStatBucket } from '@/utils/usage';
+import { formatFileSize } from '@/utils/format';
+import styles from './AuthFilesPage.module.scss';
+
+type ThemeColors = { bg: string; text: string; border?: string };
+type TypeColorSet = { light: ThemeColors; dark?: ThemeColors };
+
+// 标签类型颜色配置（对齐重构前 styles.css 的 file-type-badge 颜色）
+const TYPE_COLORS: Record<string, TypeColorSet> = {
+  qwen: {
+    light: { bg: '#e8f5e9', text: '#2e7d32' },
+    dark: { bg: '#1b5e20', text: '#81c784' }
+  },
+  gemini: {
+    light: { bg: '#e3f2fd', text: '#1565c0' },
+    dark: { bg: '#0d47a1', text: '#64b5f6' }
+  },
+  'gemini-cli': {
+    light: { bg: '#e7efff', text: '#1e4fa3' },
+    dark: { bg: '#1c3f73', text: '#a8c7ff' }
+  },
+  aistudio: {
+    light: { bg: '#f0f2f5', text: '#2f343c' },
+    dark: { bg: '#373c42', text: '#cfd3db' }
+  },
+  claude: {
+    light: { bg: '#fce4ec', text: '#c2185b' },
+    dark: { bg: '#880e4f', text: '#f48fb1' }
+  },
+  codex: {
+    light: { bg: '#fff3e0', text: '#ef6c00' },
+    dark: { bg: '#e65100', text: '#ffb74d' }
+  },
+  antigravity: {
+    light: { bg: '#e0f7fa', text: '#006064' },
+    dark: { bg: '#004d40', text: '#80deea' }
+  },
+  iflow: {
+    light: { bg: '#f3e5f5', text: '#7b1fa2' },
+    dark: { bg: '#4a148c', text: '#ce93d8' }
+  },
+  empty: {
+    light: { bg: '#f5f5f5', text: '#616161' },
+    dark: { bg: '#424242', text: '#bdbdbd' }
+  },
+  unknown: {
+    light: { bg: '#f0f0f0', text: '#666666', border: '1px dashed #999999' },
+    dark: { bg: '#3a3a3a', text: '#aaaaaa', border: '1px dashed #666666' }
+  }
+};
+
+interface ExcludedFormState {
+  provider: string;
+  modelsText: string;
+}
+
+// 标准化 auth_index 值（与 usage.ts 中的 normalizeAuthIndex 保持一致）
+function normalizeAuthIndexValue(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value.toString();
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+  return null;
+}
+
+function isRuntimeOnlyAuthFile(file: AuthFileItem): boolean {
+  const raw = file['runtime_only'] ?? file.runtimeOnly;
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'string') return raw.trim().toLowerCase() === 'true';
+  return false;
+}
+
+// 解析认证文件的统计数据
+function resolveAuthFileStats(
+  file: AuthFileItem,
+  stats: KeyStats
+): KeyStatBucket {
+  const defaultStats: KeyStatBucket = { success: 0, failure: 0 };
+  const rawFileName = file?.name || '';
+
+  // 兼容 auth_index 和 authIndex 两种字段名（API 返回的是 auth_index）
+  const rawAuthIndex = file['auth_index'] ?? file.authIndex;
+  const authIndexKey = normalizeAuthIndexValue(rawAuthIndex);
+
+  // 尝试根据 authIndex 匹配
+  if (authIndexKey && stats.byAuthIndex?.[authIndexKey]) {
+    return stats.byAuthIndex[authIndexKey];
+  }
+
+  // 尝试根据 source (文件名) 匹配
+  if (rawFileName && stats.bySource?.[rawFileName]) {
+    const fromName = stats.bySource[rawFileName];
+    if (fromName.success > 0 || fromName.failure > 0) {
+      return fromName;
+    }
+  }
+
+  // 尝试去掉扩展名后匹配
+  if (rawFileName) {
+    const nameWithoutExt = rawFileName.replace(/\.[^/.]+$/, '');
+    if (nameWithoutExt && nameWithoutExt !== rawFileName) {
+      const fromNameWithoutExt = stats.bySource?.[nameWithoutExt];
+      if (fromNameWithoutExt && (fromNameWithoutExt.success > 0 || fromNameWithoutExt.failure > 0)) {
+        return fromNameWithoutExt;
+      }
+    }
+  }
+
+  return defaultStats;
+}
+
+export function AuthFilesPage() {
+  const { t } = useTranslation();
+  const { showNotification } = useNotificationStore();
+  const connectionStatus = useAuthStore((state) => state.connectionStatus);
+  const theme = useThemeStore((state) => state.theme);
+
+  const [files, setFiles] = useState<AuthFileItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [filter, setFilter] = useState<'all' | string>('all');
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(9);
+  const [uploading, setUploading] = useState(false);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [deletingAll, setDeletingAll] = useState(false);
+  const [keyStats, setKeyStats] = useState<KeyStats>({ bySource: {}, byAuthIndex: {} });
+
+  // 详情弹窗相关
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<AuthFileItem | null>(null);
+
+  // 模型列表弹窗相关
+  const [modelsModalOpen, setModelsModalOpen] = useState(false);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsList, setModelsList] = useState<{ id: string; display_name?: string; type?: string }[]>([]);
+  const [modelsFileName, setModelsFileName] = useState('');
+  const [modelsFileType, setModelsFileType] = useState('');
+  const [modelsError, setModelsError] = useState<'unsupported' | null>(null);
+
+  // Antigravity 额度弹窗相关
+  const [quotaModalOpen, setQuotaModalOpen] = useState(false);
+  const [quotaLoading, setQuotaLoading] = useState(false);
+  const [quotaList, setQuotaList] = useState<AntigravityQuotaInfo[]>([]);
+  const [quotaEmail, setQuotaEmail] = useState('');
+  // quotaFileName removed - not needed
+  const [quotaError, setQuotaError] = useState<string | null>(null);
+
+  // Antigravity 卡片内联额度数据
+  interface InlineQuotaData {
+    claudeGpt: { percent: number; resetTime: string } | null;
+    gemini: { percent: number; resetTime: string } | null;
+  }
+  const [inlineQuotas, setInlineQuotas] = useState<Record<string, InlineQuotaData>>({});
+
+  // OAuth 排除模型相关
+  const [excluded, setExcluded] = useState<Record<string, string[]>>({});
+  const [excludedError, setExcludedError] = useState<'unsupported' | null>(null);
+  const [excludedModalOpen, setExcludedModalOpen] = useState(false);
+  const [excludedForm, setExcludedForm] = useState<ExcludedFormState>({ provider: '', modelsText: '' });
+  const [savingExcluded, setSavingExcluded] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const excludedUnsupportedRef = useRef(false);
+
+  const disableControls = connectionStatus !== 'connected';
+
+  // 格式化修改时间
+  const formatModified = (item: AuthFileItem): string => {
+    const raw = item['modtime'] ?? item.modified;
+    if (!raw) return '-';
+    const asNumber = Number(raw);
+    const date =
+      Number.isFinite(asNumber) && !Number.isNaN(asNumber)
+        ? new Date(asNumber < 1e12 ? asNumber * 1000 : asNumber)
+        : new Date(String(raw));
+    return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString();
+  };
+
+  // 加载文件列表
+  const loadFiles = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await authFilesApi.list();
+      setFiles(data?.files || []);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : t('notification.refresh_failed');
+      setError(errorMessage);
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  // 加载 key 统计
+  const loadKeyStats = useCallback(async () => {
+    try {
+      const stats = await usageApi.getKeyStats();
+      setKeyStats(stats);
+    } catch {
+      // 静默失败
+    }
+  }, []);
+
+  // 加载 OAuth 排除列表
+  const loadExcluded = useCallback(async () => {
+    try {
+      const res = await authFilesApi.getOauthExcludedModels();
+      excludedUnsupportedRef.current = false;
+      setExcluded(res || {});
+      setExcludedError(null);
+    } catch (err: unknown) {
+      const status =
+        typeof err === 'object' && err !== null && 'status' in err
+          ? (err as { status?: unknown }).status
+          : undefined;
+
+      if (status === 404) {
+        setExcluded({});
+        setExcludedError('unsupported');
+        if (!excludedUnsupportedRef.current) {
+          excludedUnsupportedRef.current = true;
+          showNotification(t('oauth_excluded.upgrade_required'), 'warning');
+        }
+        return;
+      }
+      // 静默失败
+    }
+  }, [showNotification, t]);
+
+  // 加载 Antigravity 卡片内联额度
+  const loadInlineQuotas = useCallback(async (fileList: AuthFileItem[]) => {
+    const antigravityFiles = fileList.filter((f) => f.type === 'antigravity');
+    if (antigravityFiles.length === 0) return;
+
+    const newQuotas: Record<string, InlineQuotaData> = {};
+    
+    await Promise.all(
+      antigravityFiles.map(async (file) => {
+        try {
+          const response = await authFilesApi.getAntigravityQuotas(file.name);
+          if (response.success && response.quotas) {
+            // 计算 Claude/GPT 平均额度（Claude 和 GPT 类别）
+            const claudeGptQuotas = response.quotas.filter(
+              (q) => q.category === 'Claude' || q.category === 'GPT'
+            );
+            // 计算 Gemini 平均额度
+            const geminiQuotas = response.quotas.filter((q) => q.category === 'Gemini');
+
+            newQuotas[file.name] = {
+              claudeGpt: claudeGptQuotas.length > 0 ? {
+                percent: Math.min(...claudeGptQuotas.map((q) => q.remainingPercent)),
+                resetTime: claudeGptQuotas[0]?.resetTimeLocal || ''
+              } : null,
+              gemini: geminiQuotas.length > 0 ? {
+                percent: Math.min(...geminiQuotas.map((q) => q.remainingPercent)),
+                resetTime: geminiQuotas[0]?.resetTimeLocal || ''
+              } : null
+            };
+          }
+        } catch {
+          // 静默失败
+        }
+      })
+    );
+
+    setInlineQuotas((prev) => ({ ...prev, ...newQuotas }));
+  }, []);
+
+  useEffect(() => {
+    loadFiles();
+    loadKeyStats();
+    loadExcluded();
+  }, [loadFiles, loadKeyStats, loadExcluded]);
+
+  // 当文件列表加载完成后，加载 Antigravity 内联额度
+  useEffect(() => {
+    if (files.length > 0) {
+      loadInlineQuotas(files);
+    }
+  }, [files, loadInlineQuotas]);
+
+  // 提取所有存在的类型
+  const existingTypes = useMemo(() => {
+    const types = new Set<string>(['all']);
+    files.forEach((file) => {
+      if (file.type) {
+        types.add(file.type);
+      }
+    });
+    return Array.from(types);
+  }, [files]);
+
+  // 过滤和搜索
+  const filtered = useMemo(() => {
+    return files.filter((item) => {
+      const matchType = filter === 'all' || item.type === filter;
+      const term = search.trim().toLowerCase();
+      const matchSearch =
+        !term ||
+        item.name.toLowerCase().includes(term) ||
+        (item.type || '').toString().toLowerCase().includes(term) ||
+        (item.provider || '').toString().toLowerCase().includes(term);
+      return matchType && matchSearch;
+    });
+  }, [files, filter, search]);
+
+  // 分页计算
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const start = (currentPage - 1) * pageSize;
+  const pageItems = filtered.slice(start, start + pageSize);
+
+  // 统计信息
+  const totalSize = useMemo(() => files.reduce((sum, item) => sum + (item.size || 0), 0), [files]);
+
+  // 点击上传
+  const handleUploadClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  // 处理文件上传（支持多选）
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = event.target.files;
+    if (!fileList || fileList.length === 0) return;
+
+    const filesToUpload = Array.from(fileList);
+    const validFiles: File[] = [];
+    const invalidFiles: string[] = [];
+
+    filesToUpload.forEach((file) => {
+      if (file.name.endsWith('.json')) {
+        validFiles.push(file);
+      } else {
+        invalidFiles.push(file.name);
+      }
+    });
+
+    if (invalidFiles.length > 0) {
+      showNotification(t('auth_files.upload_error_json'), 'error');
+    }
+
+    if (validFiles.length === 0) {
+      event.target.value = '';
+      return;
+    }
+
+    setUploading(true);
+    let successCount = 0;
+    const failed: { name: string; message: string }[] = [];
+
+    for (const file of validFiles) {
+      try {
+        await authFilesApi.upload(file);
+        successCount++;
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+        failed.push({ name: file.name, message: errorMessage });
+      }
+    }
+
+    if (successCount > 0) {
+      const suffix = validFiles.length > 1 ? ` (${successCount}/${validFiles.length})` : '';
+      showNotification(`${t('auth_files.upload_success')}${suffix}`, failed.length ? 'warning' : 'success');
+      await loadFiles();
+      await loadKeyStats();
+    }
+
+    if (failed.length > 0) {
+      const details = failed.map((item) => `${item.name}: ${item.message}`).join('; ');
+      showNotification(`${t('notification.upload_failed')}: ${details}`, 'error');
+    }
+
+    setUploading(false);
+    event.target.value = '';
+  };
+
+  // 删除单个文件
+  const handleDelete = async (name: string) => {
+    if (!window.confirm(`${t('auth_files.delete_confirm')} "${name}" ?`)) return;
+    setDeleting(name);
+    try {
+      await authFilesApi.deleteFile(name);
+      showNotification(t('auth_files.delete_success'), 'success');
+      setFiles((prev) => prev.filter((item) => item.name !== name));
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('notification.delete_failed')}: ${errorMessage}`, 'error');
+    } finally {
+      setDeleting(null);
+    }
+  };
+
+  // 删除全部（根据筛选类型）
+  const handleDeleteAll = async () => {
+    const isFiltered = filter !== 'all';
+    const typeLabel = isFiltered ? getTypeLabel(filter) : t('auth_files.filter_all');
+    const confirmMessage = isFiltered
+      ? t('auth_files.delete_filtered_confirm', { type: typeLabel })
+      : t('auth_files.delete_all_confirm');
+
+    if (!window.confirm(confirmMessage)) return;
+
+    setDeletingAll(true);
+    try {
+      if (!isFiltered) {
+        // 删除全部
+        await authFilesApi.deleteAll();
+        showNotification(t('auth_files.delete_all_success'), 'success');
+        setFiles((prev) => prev.filter((file) => isRuntimeOnlyAuthFile(file)));
+      } else {
+        // 删除筛选类型的文件
+        const filesToDelete = files.filter(
+          (f) => f.type === filter && !isRuntimeOnlyAuthFile(f)
+        );
+
+        if (filesToDelete.length === 0) {
+          showNotification(t('auth_files.delete_filtered_none', { type: typeLabel }), 'info');
+          setDeletingAll(false);
+          return;
+        }
+
+        let success = 0;
+        let failed = 0;
+        const deletedNames: string[] = [];
+
+        for (const file of filesToDelete) {
+          try {
+            await authFilesApi.deleteFile(file.name);
+            success++;
+            deletedNames.push(file.name);
+          } catch {
+            failed++;
+          }
+        }
+
+        setFiles((prev) => prev.filter((f) => !deletedNames.includes(f.name)));
+
+        if (failed === 0) {
+          showNotification(
+            t('auth_files.delete_filtered_success', { count: success, type: typeLabel }),
+            'success'
+          );
+        } else {
+          showNotification(
+            t('auth_files.delete_filtered_partial', { success, failed, type: typeLabel }),
+            'warning'
+          );
+        }
+        setFilter('all');
+      }
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('notification.delete_failed')}: ${errorMessage}`, 'error');
+    } finally {
+      setDeletingAll(false);
+    }
+  };
+
+  // 下载文件
+  const handleDownload = async (name: string) => {
+    try {
+      const response = await apiClient.getRaw(`/auth-files/download?name=${encodeURIComponent(name)}`, {
+        responseType: 'blob'
+      });
+      const blob = new Blob([response.data]);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.click();
+      window.URL.revokeObjectURL(url);
+      showNotification(t('auth_files.download_success'), 'success');
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('notification.download_failed')}: ${errorMessage}`, 'error');
+    }
+  };
+
+  // 显示详情弹窗
+  const showDetails = (file: AuthFileItem) => {
+    setSelectedFile(file);
+    setDetailModalOpen(true);
+  };
+
+  // 显示模型列表
+  const showModels = async (item: AuthFileItem) => {
+    setModelsFileName(item.name);
+    setModelsFileType(item.type || '');
+    setModelsList([]);
+    setModelsError(null);
+    setModelsModalOpen(true);
+    setModelsLoading(true);
+    try {
+      const models = await authFilesApi.getModelsForAuthFile(item.name);
+      setModelsList(models);
+    } catch (err) {
+      // 检测是否是 API 不支持的错误 (404 或特定错误消息)
+      const errorMessage = err instanceof Error ? err.message : '';
+      if (errorMessage.includes('404') || errorMessage.includes('not found') || errorMessage.includes('Not Found')) {
+        setModelsError('unsupported');
+      } else {
+        showNotification(`${t('notification.load_failed')}: ${errorMessage}`, 'error');
+      }
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  // 显示 Antigravity 额度
+  const showQuotas = async (item: AuthFileItem) => {
+    // setQuotaFileName removed
+    setQuotaList([]);
+    setQuotaEmail('');
+    setQuotaError(null);
+    setQuotaModalOpen(true);
+    setQuotaLoading(true);
+    try {
+      const response = await authFilesApi.getAntigravityQuotas(item.name);
+      if (!response.success) {
+        throw new Error(response.error || '获取额度失败');
+      }
+      setQuotaList(response.quotas || []);
+      setQuotaEmail(response.email || '');
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : '获取额度失败';
+      setQuotaError(errorMessage);
+    } finally {
+      setQuotaLoading(false);
+    }
+  };
+
+  // 获取额度颜色类名
+  const getQuotaColorClass = (percent: number): string => {
+    if (percent > 50) return styles.quotaHigh;
+    if (percent > 20) return styles.quotaMedium;
+    return styles.quotaLow;
+  };
+
+  // 按分类分组额度 - 合并相同额度类型
+  // Claude 和 GPT 共用一个额度，Gemini 系列共用一个额度
+  const groupedQuotas = useMemo(() => {
+    // 合并策略：每个分类只取一个代表性的额度
+    const categoryMap: Record<string, AntigravityQuotaInfo> = {};
+    
+    quotaList
+      // 过滤掉无用的模型（如 chat_xxxxx）
+      .filter((q) => !q.model.startsWith('chat_'))
+      .forEach((q) => {
+        let cat = q.category || 'Other';
+        
+        // Claude 和 GPT 合并为 "Claude / GPT" 分类
+        if (cat === 'Claude' || cat === 'GPT') {
+          cat = 'Claude / GPT';
+        }
+        
+        // 如果该分类还没有记录，或者当前额度比已记录的更低（取最小值更保守）
+        if (!categoryMap[cat] || q.remainingPercent < categoryMap[cat].remainingPercent) {
+          categoryMap[cat] = {
+            ...q,
+            category: cat,
+            // 使用分类名作为显示名称
+            model: cat === 'Claude / GPT' ? 'Claude & GPT 共享额度' : 
+                   cat === 'Gemini' ? 'Gemini 系列共享额度' : q.model,
+          };
+        }
+      });
+    
+    // 转换为分组格式（每个分类只有一个条目），过滤掉 Other 分类
+    const grouped: Record<string, AntigravityQuotaInfo[]> = {};
+    Object.entries(categoryMap)
+      .filter(([cat]) => cat !== 'Other')
+      .forEach(([cat, quota]) => {
+        grouped[cat] = [quota];
+      });
+    
+    return grouped;
+  }, [quotaList]);
+
+  // 检查模型是否被 OAuth 排除
+  const isModelExcluded = (modelId: string, providerType: string): boolean => {
+    const excludedModels = excluded[providerType] || [];
+    return excludedModels.some(pattern => {
+      if (pattern.includes('*')) {
+        // 支持通配符匹配
+        const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$', 'i');
+        return regex.test(modelId);
+      }
+      return pattern.toLowerCase() === modelId.toLowerCase();
+    });
+  };
+
+  // 获取类型标签显示文本
+  const getTypeLabel = (type: string): string => {
+    const key = `auth_files.filter_${type}`;
+    const translated = t(key);
+    if (translated !== key) return translated;
+    if (type.toLowerCase() === 'iflow') return 'iFlow';
+    return type.charAt(0).toUpperCase() + type.slice(1);
+  };
+
+  // 获取类型颜色
+  const getTypeColor = (type: string): ThemeColors => {
+    const set = TYPE_COLORS[type] || TYPE_COLORS.unknown;
+    return theme === 'dark' && set.dark ? set.dark : set.light;
+  };
+
+  // OAuth 排除相关方法
+  const openExcludedModal = (provider?: string) => {
+    const models = provider ? excluded[provider] : [];
+    setExcludedForm({
+      provider: provider || '',
+      modelsText: Array.isArray(models) ? models.join('\n') : ''
+    });
+    setExcludedModalOpen(true);
+  };
+
+  const saveExcludedModels = async () => {
+    const provider = excludedForm.provider.trim();
+    if (!provider) {
+      showNotification(t('oauth_excluded.provider_required'), 'error');
+      return;
+    }
+    const models = excludedForm.modelsText
+      .split(/[\n,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    setSavingExcluded(true);
+    try {
+      if (models.length) {
+        await authFilesApi.saveOauthExcludedModels(provider, models);
+      } else {
+        await authFilesApi.deleteOauthExcludedEntry(provider);
+      }
+      await loadExcluded();
+      showNotification(t('oauth_excluded.save_success'), 'success');
+      setExcludedModalOpen(false);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('oauth_excluded.save_failed')}: ${errorMessage}`, 'error');
+    } finally {
+      setSavingExcluded(false);
+    }
+  };
+
+  const deleteExcluded = async (provider: string) => {
+    if (!window.confirm(t('oauth_excluded.delete_confirm', { provider }))) return;
+    try {
+      await authFilesApi.deleteOauthExcludedEntry(provider);
+      await loadExcluded();
+      showNotification(t('oauth_excluded.delete_success'), 'success');
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('oauth_excluded.delete_failed')}: ${errorMessage}`, 'error');
+    }
+  };
+
+  // 渲染标签筛选器
+  const renderFilterTags = () => (
+    <div className={styles.filterTags}>
+      {existingTypes.map((type) => {
+        const isActive = filter === type;
+        const color = type === 'all' ? { bg: 'var(--bg-tertiary)', text: 'var(--text-primary)' } : getTypeColor(type);
+        const activeTextColor = theme === 'dark' ? '#111827' : '#fff';
+        return (
+          <button
+            key={type}
+            className={`${styles.filterTag} ${isActive ? styles.filterTagActive : ''}`}
+            style={{
+              backgroundColor: isActive ? color.text : color.bg,
+              color: isActive ? activeTextColor : color.text,
+              borderColor: color.text
+            }}
+            onClick={() => {
+              setFilter(type);
+              setPage(1);
+            }}
+          >
+            {getTypeLabel(type)}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  // 渲染单个认证文件卡片
+  const renderFileCard = (item: AuthFileItem) => {
+      const fileStats = resolveAuthFileStats(item, keyStats);
+    const isRuntimeOnly = isRuntimeOnlyAuthFile(item);
+    const typeColor = getTypeColor(item.type || 'unknown');
+
+    return (
+      <div key={item.name} className={styles.fileCard}>
+        <div className={styles.cardHeader}>
+          <span
+            className={styles.typeBadge}
+            style={{
+              backgroundColor: typeColor.bg,
+              color: typeColor.text,
+              ...(typeColor.border ? { border: typeColor.border } : {})
+            }}
+          >
+            {getTypeLabel(item.type || 'unknown')}
+          </span>
+          <span className={styles.fileName}>{item.name}</span>
+        </div>
+
+        <div className={styles.cardMeta}>
+          <span>{t('auth_files.file_size')}: {item.size ? formatFileSize(item.size) : '-'}</span>
+          <span>{t('auth_files.file_modified')}: {formatModified(item)}</span>
+        </div>
+
+        <div className={styles.cardStats}>
+          <span className={`${styles.statPill} ${styles.statSuccess}`}>
+            {t('stats.success')}: {fileStats.success}
+          </span>
+          <span className={`${styles.statPill} ${styles.statFailure}`}>
+            {t('stats.failure')}: {fileStats.failure}
+          </span>
+        </div>
+
+        {/* Antigravity 内联额度显示 */}
+        {item.type === 'antigravity' && inlineQuotas[item.name] && (
+          <div className={styles.quotaInline}>
+            {inlineQuotas[item.name].claudeGpt && (
+              <div className={styles.quotaInlineItem}>
+                <span className={styles.quotaInlineLabel}>Claude/GPT</span>
+                <div className={styles.quotaInlineBar}>
+                  <div
+                    className={`${styles.quotaInlineBarFill} ${
+                      inlineQuotas[item.name].claudeGpt!.percent > 50
+                        ? styles.quotaHigh
+                        : inlineQuotas[item.name].claudeGpt!.percent > 20
+                          ? styles.quotaMedium
+                          : styles.quotaLow
+                    }`}
+                    style={{ width: `${inlineQuotas[item.name].claudeGpt!.percent}%` }}
+                  />
+                </div>
+                <span className={`${styles.quotaInlinePercent} ${
+                  inlineQuotas[item.name].claudeGpt!.percent > 50
+                    ? styles.quotaHigh
+                    : inlineQuotas[item.name].claudeGpt!.percent > 20
+                      ? styles.quotaMedium
+                      : styles.quotaLow
+                }`}>
+                  {Math.round(inlineQuotas[item.name].claudeGpt!.percent)}%
+                </span>
+                <span className={styles.quotaInlineTime}>
+                  {inlineQuotas[item.name].claudeGpt!.resetTime}
+                </span>
+              </div>
+            )}
+            {inlineQuotas[item.name].gemini && (
+              <div className={styles.quotaInlineItem}>
+                <span className={styles.quotaInlineLabel}>Gemini</span>
+                <div className={styles.quotaInlineBar}>
+                  <div
+                    className={`${styles.quotaInlineBarFill} ${
+                      inlineQuotas[item.name].gemini!.percent > 50
+                        ? styles.quotaHigh
+                        : inlineQuotas[item.name].gemini!.percent > 20
+                          ? styles.quotaMedium
+                          : styles.quotaLow
+                    }`}
+                    style={{ width: `${inlineQuotas[item.name].gemini!.percent}%` }}
+                  />
+                </div>
+                <span className={`${styles.quotaInlinePercent} ${
+                  inlineQuotas[item.name].gemini!.percent > 50
+                    ? styles.quotaHigh
+                    : inlineQuotas[item.name].gemini!.percent > 20
+                      ? styles.quotaMedium
+                      : styles.quotaLow
+                }`}>
+                  {Math.round(inlineQuotas[item.name].gemini!.percent)}%
+                </span>
+                <span className={styles.quotaInlineTime}>
+                  {inlineQuotas[item.name].gemini!.resetTime}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className={styles.cardActions}>
+          {isRuntimeOnly ? (
+            <div className={styles.virtualBadge}>{t('auth_files.type_virtual') || '虚拟认证文件'}</div>
+          ) : (
+            <>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => showModels(item)}
+                className={styles.iconButton}
+                title={t('auth_files.models_button', { defaultValue: '模型' })}
+                disabled={disableControls}
+              >
+                <IconBot className={styles.actionIcon} size={16} />
+              </Button>
+              {item.type === 'antigravity' && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => showQuotas(item)}
+                  className={styles.iconButton}
+                  title={t('auth_files.quota_button', { defaultValue: '额度' })}
+                  disabled={disableControls}
+                >
+                  <IconPieChart className={styles.actionIcon} size={16} />
+                </Button>
+              )}
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => showDetails(item)}
+                className={styles.iconButton}
+                title={t('common.info', { defaultValue: '关于' })}
+                disabled={disableControls}
+              >
+                <IconInfo className={styles.actionIcon} size={16} />
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => handleDownload(item.name)}
+                className={styles.iconButton}
+                title={t('auth_files.download_button')}
+                disabled={disableControls}
+              >
+                <IconDownload className={styles.actionIcon} size={16} />
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={() => handleDelete(item.name)}
+                className={styles.iconButton}
+                title={t('auth_files.delete_button')}
+                disabled={disableControls || deleting === item.name}
+              >
+                {deleting === item.name ? (
+                  <LoadingSpinner size={14} />
+                ) : (
+                  <IconTrash2 className={styles.actionIcon} size={16} />
+                )}
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className={styles.container}>
+      <div className={styles.pageHeader}>
+        <h1 className={styles.pageTitle}>{t('auth_files.title')}</h1>
+        <p className={styles.description}>{t('auth_files.description')}</p>
+      </div>
+
+      <Card
+        title={t('auth_files.title_section')}
+        extra={
+          <div className={styles.headerActions}>
+            <Button variant="secondary" size="sm" onClick={() => { loadFiles(); loadKeyStats(); }} disabled={loading}>
+              {t('common.refresh')}
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={handleDeleteAll}
+              disabled={disableControls || loading || deletingAll}
+              loading={deletingAll}
+            >
+              {filter === 'all' ? t('auth_files.delete_all_button') : `${t('common.delete')} ${getTypeLabel(filter)}`}
+            </Button>
+            <Button size="sm" onClick={handleUploadClick} disabled={disableControls || uploading} loading={uploading}>
+              {t('auth_files.upload_button')}
+            </Button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              multiple
+              style={{ display: 'none' }}
+              onChange={handleFileChange}
+            />
+          </div>
+        }
+      >
+        {error && <div className={styles.errorBox}>{error}</div>}
+
+        {/* 筛选区域 */}
+        <div className={styles.filterSection}>
+          {renderFilterTags()}
+
+          <div className={styles.filterControls}>
+            <div className={styles.filterItem}>
+              <label>{t('auth_files.search_label')}</label>
+              <Input
+                value={search}
+                onChange={(e) => {
+                  setSearch(e.target.value);
+                  setPage(1);
+                }}
+                placeholder={t('auth_files.search_placeholder')}
+              />
+            </div>
+            <div className={styles.filterItem}>
+              <label>{t('auth_files.page_size_label')}</label>
+              <select
+                className={styles.pageSizeSelect}
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Number(e.target.value) || 9);
+                  setPage(1);
+                }}
+              >
+                <option value={6}>6</option>
+                <option value={9}>9</option>
+                <option value={12}>12</option>
+                <option value={18}>18</option>
+                <option value={24}>24</option>
+              </select>
+            </div>
+            <div className={styles.filterItem}>
+              <label>{t('common.info')}</label>
+              <div className={styles.statsInfo}>
+                {files.length} {t('auth_files.files_count')} · {formatFileSize(totalSize)}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 卡片网格 */}
+        {loading ? (
+          <div className={styles.hint}>{t('common.loading')}</div>
+        ) : pageItems.length === 0 ? (
+          <EmptyState title={t('auth_files.search_empty_title')} description={t('auth_files.search_empty_desc')} />
+        ) : (
+          <div className={styles.fileGrid}>
+            {pageItems.map(renderFileCard)}
+          </div>
+        )}
+
+        {/* 分页 */}
+        {!loading && filtered.length > pageSize && (
+          <div className={styles.pagination}>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
+            >
+              {t('auth_files.pagination_prev')}
+            </Button>
+            <div className={styles.pageInfo}>
+              {t('auth_files.pagination_info', {
+                current: currentPage,
+                total: totalPages,
+                count: filtered.length
+              })}
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              disabled={currentPage >= totalPages}
+            >
+              {t('auth_files.pagination_next')}
+            </Button>
+          </div>
+        )}
+      </Card>
+
+      {/* OAuth 排除列表卡片 */}
+      <Card
+        title={t('oauth_excluded.title')}
+        extra={
+          <Button
+            size="sm"
+            onClick={() => openExcludedModal()}
+            disabled={disableControls || excludedError === 'unsupported'}
+          >
+            {t('oauth_excluded.add')}
+          </Button>
+        }
+      >
+        {excludedError === 'unsupported' ? (
+          <EmptyState
+            title={t('oauth_excluded.upgrade_required_title')}
+            description={t('oauth_excluded.upgrade_required_desc')}
+          />
+        ) : Object.keys(excluded).length === 0 ? (
+          <EmptyState title={t('oauth_excluded.list_empty_all')} />
+        ) : (
+          <div className={styles.excludedList}>
+            {Object.entries(excluded).map(([provider, models]) => (
+              <div key={provider} className={styles.excludedItem}>
+                <div className={styles.excludedInfo}>
+                  <div className={styles.excludedProvider}>{provider}</div>
+                  <div className={styles.excludedModels}>
+                    {models?.length
+                      ? t('oauth_excluded.model_count', { count: models.length })
+                      : t('oauth_excluded.no_models')}
+                  </div>
+                </div>
+                <div className={styles.excludedActions}>
+                  <Button variant="secondary" size="sm" onClick={() => openExcludedModal(provider)}>
+                    {t('common.edit')}
+                  </Button>
+                  <Button variant="danger" size="sm" onClick={() => deleteExcluded(provider)}>
+                    {t('oauth_excluded.delete')}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* 详情弹窗 */}
+      <Modal
+        open={detailModalOpen}
+        onClose={() => setDetailModalOpen(false)}
+        title={selectedFile?.name || t('auth_files.title_section')}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setDetailModalOpen(false)}>
+              {t('common.close')}
+            </Button>
+            <Button
+              onClick={() => {
+                if (selectedFile) {
+                  const text = JSON.stringify(selectedFile, null, 2);
+                  navigator.clipboard.writeText(text).then(() => {
+                    showNotification(t('notification.link_copied'), 'success');
+                  });
+                }
+              }}
+            >
+              {t('common.copy')}
+            </Button>
+          </>
+        }
+      >
+        {selectedFile && (
+          <div className={styles.detailContent}>
+            <pre className={styles.jsonContent}>{JSON.stringify(selectedFile, null, 2)}</pre>
+          </div>
+        )}
+      </Modal>
+
+      {/* 模型列表弹窗 */}
+      <Modal
+        open={modelsModalOpen}
+        onClose={() => setModelsModalOpen(false)}
+        title={t('auth_files.models_title', { defaultValue: '支持的模型' }) + ` - ${modelsFileName}`}
+        footer={
+          <Button variant="secondary" onClick={() => setModelsModalOpen(false)}>
+            {t('common.close')}
+          </Button>
+        }
+      >
+        {modelsLoading ? (
+          <div className={styles.hint}>{t('auth_files.models_loading', { defaultValue: '正在加载模型列表...' })}</div>
+        ) : modelsError === 'unsupported' ? (
+          <EmptyState
+            title={t('auth_files.models_unsupported', { defaultValue: '当前版本不支持此功能' })}
+            description={t('auth_files.models_unsupported_desc', { defaultValue: '请更新 CLI Proxy API 到最新版本后重试' })}
+          />
+        ) : modelsList.length === 0 ? (
+          <EmptyState
+            title={t('auth_files.models_empty', { defaultValue: '该凭证暂无可用模型' })}
+            description={t('auth_files.models_empty_desc', { defaultValue: '该认证凭证可能尚未被服务器加载或没有绑定任何模型' })}
+          />
+        ) : (
+          <div className={styles.modelsList}>
+            {modelsList.map((model) => {
+              const isExcluded = isModelExcluded(model.id, modelsFileType);
+              return (
+                <div
+                  key={model.id}
+                  className={`${styles.modelItem} ${isExcluded ? styles.modelItemExcluded : ''}`}
+                  onClick={() => {
+                    navigator.clipboard.writeText(model.id);
+                    showNotification(t('notification.link_copied', { defaultValue: '已复制到剪贴板' }), 'success');
+                  }}
+                  title={isExcluded ? t('auth_files.models_excluded_hint', { defaultValue: '此模型已被 OAuth 排除' }) : t('common.copy', { defaultValue: '点击复制' })}
+                >
+                  <span className={styles.modelId}>{model.id}</span>
+                  {model.display_name && model.display_name !== model.id && (
+                    <span className={styles.modelDisplayName}>{model.display_name}</span>
+                  )}
+                  {model.type && (
+                    <span className={styles.modelType}>{model.type}</span>
+                  )}
+                  {isExcluded && (
+                    <span className={styles.modelExcludedBadge}>{t('auth_files.models_excluded_badge', { defaultValue: '已排除' })}</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {/* OAuth 排除弹窗 */}
+      <Modal
+        open={excludedModalOpen}
+        onClose={() => setExcludedModalOpen(false)}
+        title={t('oauth_excluded.add_title')}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setExcludedModalOpen(false)} disabled={savingExcluded}>
+              {t('common.cancel')}
+            </Button>
+            <Button onClick={saveExcludedModels} loading={savingExcluded}>
+              {t('oauth_excluded.save')}
+            </Button>
+          </>
+        }
+      >
+        <Input
+          label={t('oauth_excluded.provider_label')}
+          placeholder={t('oauth_excluded.provider_placeholder')}
+          value={excludedForm.provider}
+          onChange={(e) => setExcludedForm((prev) => ({ ...prev, provider: e.target.value }))}
+        />
+        <div className={styles.formGroup}>
+          <label>{t('oauth_excluded.models_label')}</label>
+          <textarea
+            className={styles.textarea}
+            rows={4}
+            placeholder={t('oauth_excluded.models_placeholder')}
+            value={excludedForm.modelsText}
+            onChange={(e) => setExcludedForm((prev) => ({ ...prev, modelsText: e.target.value }))}
+          />
+          <div className={styles.hint}>{t('oauth_excluded.models_hint')}</div>
+        </div>
+      </Modal>
+
+      {/* Antigravity 额度弹窗 */}
+      <Modal
+        open={quotaModalOpen}
+        onClose={() => setQuotaModalOpen(false)}
+        title={t('auth_files.quota_title', { defaultValue: '模型额度' })}
+        footer={
+          <Button variant="secondary" onClick={() => setQuotaModalOpen(false)}>
+            {t('common.close')}
+          </Button>
+        }
+      >
+        {quotaLoading ? (
+          <div className={styles.hint}>{t('auth_files.quota_loading', { defaultValue: '正在加载额度信息...' })}</div>
+        ) : quotaError ? (
+          <EmptyState
+            title={t('auth_files.quota_error', { defaultValue: '获取额度失败' })}
+            description={quotaError}
+          />
+        ) : quotaList.length === 0 ? (
+          <EmptyState
+            title={t('auth_files.quota_empty', { defaultValue: '暂无额度信息' })}
+            description={t('auth_files.quota_empty_desc', { defaultValue: '该账号可能尚未使用过任何模型' })}
+          />
+        ) : (
+          <div className={styles.quotaContainer}>
+            {quotaEmail && (
+              <div className={styles.quotaEmail}>
+                {t('auth_files.quota_email', { defaultValue: '账号' })}: {quotaEmail}
+              </div>
+            )}
+            {Object.entries(groupedQuotas).map(([category, quotas]) => (
+              <div key={category} className={styles.quotaCategory}>
+                <div className={styles.quotaCategoryTitle}>{category}</div>
+                <div className={styles.quotaList}>
+                  {quotas.map((q) => (
+                    <div key={q.model} className={styles.quotaItem}>
+                      <div className={styles.quotaModel}>{q.model}</div>
+                      <div className={styles.quotaProgress}>
+                        <div
+                          className={`${styles.quotaBar} ${getQuotaColorClass(q.remainingPercent)}`}
+                          style={{ width: `${q.remainingPercent}%` }}
+                        />
+                      </div>
+                      <div className={`${styles.quotaPercent} ${getQuotaColorClass(q.remainingPercent)}`}>
+                        {q.remainingPercent.toFixed(1)}%
+                      </div>
+                      <div className={styles.quotaReset} title={`${t('auth_files.quota_reset', { defaultValue: '重置' })}: ${q.resetTime}`}>
+                        <IconClock size={12} />
+                        {q.resetTimeLocal}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
